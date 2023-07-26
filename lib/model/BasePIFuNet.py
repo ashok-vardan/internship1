@@ -1,22 +1,39 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F 
+import torch.nn.functional as F
 
-from ..geometry import index, orthogonal, perspective
+class Generator(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(Generator, self).__init__()
+        self.fc = nn.Linear(input_dim, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, output_dim)
 
-class BasePIFuNet(nn.Module):
+    def forward(self, x):
+        x = F.relu(self.fc(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+class Discriminator(nn.Module):
+    def __init__(self, input_dim):
+        super(Discriminator, self).__init__()
+        self.fc = nn.Linear(input_dim, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = F.relu(self.fc(x))
+        x = F.relu(self.fc2(x))
+        x = torch.sigmoid(self.fc3(x))
+        return x
+class BasePIFuGAN(nn.Module):
     def __init__(self,
                  projection_mode='orthogonal',
                  criteria={'occ': nn.MSELoss()},
+                 input_dim=3,
+                 output_dim=1,
                  ):
-        '''
-        args:
-            projection_mode: orthonal / perspective
-            error_term: point-wise error term 
-        '''
-        super(BasePIFuNet, self).__init__()
+        super(BasePIFuGAN, self).__init__()
         self.name = 'base'
 
         self.criteria = criteria
@@ -24,75 +41,42 @@ class BasePIFuNet(nn.Module):
         self.index = index
         self.projection = orthogonal if projection_mode == 'orthogonal' else perspective
 
-        self.preds = None
-        self.labels = None
-        self.nmls = None
-        self.labels_nml = None
-        self.preds_surface = None # with normal loss only
+        self.generator = Generator(input_dim, output_dim)
+        self.discriminator = Discriminator(input_dim + output_dim)
 
-    def forward(self, points, images, calibs, transforms=None):
+    def forward(self, points, images, calibs, transforms=None, labels=None):
         '''
         args:
             points: [B, 3, N] 3d points in world space
             images: [B, C, H, W] input images
             calibs: [B, 3, 4] calibration matrices for each image
             transforms: [B, 2, 3] image space coordinate transforms
+            labels: [B, C, N] ground truth labels (for supervision only)
         return:
             [B, C, N] prediction corresponding to the given points
         '''
-        self.filter(images)
-        self.query(points, calibs, transforms)
-        return self.get_preds()
+        # Generate predictions using the generator
+        self.preds = self.generator(points.view(points.size(0), -1))
 
-    def filter(self, images):
-        '''
-        apply a fully convolutional network to images.
-        the resulting feature will be stored.
-        args:
-            images: [B, C, H, W]
-        '''
-        None
-    
-    def query(self, points, calibs, trasnforms=None, labels=None):
-        '''
-        given 3d points, we obtain 2d projection of these given the camera matrices.
-        filter needs to be called beforehand.
-        the prediction is stored to self.preds
-        args:
-            points: [B, 3, N] 3d points in world space
-            calibs: [B, 3, 4] calibration matrices for each image
-            transforms: [B, 2, 3] image space coordinate transforms
-            labels: [B, C, N] ground truth labels (for supervision only)
-        return:
-            [B, C, N] prediction
-        '''
-        None
+        # Compute adversarial loss using the discriminator
+        if labels is not None:
+            real_samples = torch.cat((points.view(points.size(0), -1), labels.view(labels.size(0), -1)), dim=1)
+            fake_samples = torch.cat((points.view(points.size(0), -1), self.preds.view(self.preds.size(0), -1)), dim=1)
+            real_labels = torch.ones(points.size(0), 1).to(points.device)
+            fake_labels = torch.zeros(points.size(0), 1).to(points.device)
 
-    def calc_normal(self, points, calibs, transforms=None, delta=0.1):
-        '''
-        return surface normal in 'model' space.
-        it computes normal only in the last stack.
-        note that the current implementation use forward difference.
-        args:
-            points: [B, 3, N] 3d points in world space
-            calibs: [B, 3, 4] calibration matrices for each image
-            transforms: [B, 2, 3] image space coordinate transforms
-            delta: perturbation for finite difference
-        '''
-        None
+            real_prob = self.discriminator(real_samples)
+            fake_prob = self.discriminator(fake_samples)
 
-    def get_preds(self):
-        '''
-        return the current prediction.
-        return:
-            [B, C, N] prediction
-        '''
+            self.adversarial_loss = F.binary_cross_entropy(fake_prob, real_labels) + F.binary_cross_entropy(real_prob, fake_labels)
+        else:
+            self.adversarial_loss = 0.0
+
         return self.preds
 
     def get_error(self, gamma=None):
         '''
         return the loss given the ground truth labels and prediction
         '''
-        return self.error_term(self.preds, self.labels, gamma)
+        return self.criteria['occ'](self.preds, self.labels) + self.adversarial_loss
 
-    
